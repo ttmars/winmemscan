@@ -10,6 +10,10 @@ import (
 )
 
 func main() {
+	run()
+}
+
+func run() {
 	log.SetFlags(log.Lshortfile)
 
 	if len(os.Args) != 2 {

@@ -15,24 +15,13 @@ import (
 )
 
 type MemScanner struct {
-	Bit         int            // 搜索位
-	ProcessName string         // 进程名称
-	PID         uint32         // 进程PID
-	MemFD       *os.File       // 进程内存文件描述符
-	PmapItems   []PmapItem     // 可扫描内存段
-	Result      []int64        // 当前搜索结果（偏移）
-	Handle      windows.Handle // 进程句柄
-}
-
-// Flag
-// #define LF32_FIXED 0x00000001
-// #define LF32_FREE 0x00000002
-// #define LF32_MOVEABLE 0x00000004
-type PmapItem struct {
-	Address uintptr
-	Kbytes  uint32 // 字节非kb
-	Module  string
-	Flag    uint32
+	Bit         int                              // 搜索位
+	ProcessName string                           // 进程名称
+	PID         uint32                           // 进程PID
+	MemFD       *os.File                         // 进程内存文件描述符
+	PmapItems   []windows.MemoryBasicInformation // 可扫描内存段
+	Result      []int64                          // 当前搜索结果（偏移）
+	Handle      windows.Handle                   // 进程句柄
 }
 
 func NewMemScanner(name string) (*MemScanner, error) {
@@ -55,17 +44,17 @@ func NewMemScanner(name string) (*MemScanner, error) {
 		log.Fatal(err)
 	}
 
-	scan.PmapItems, err = GetPmapItems(scan.PID)
-	if err != nil {
-		log.Fatal(err)
-	}
+	scan.LoadPmapItems()
 
 	return scan, nil
 }
 
+// State #define MEM_COMMIT 0x1000
+// Protect #define PAGE_READWRITE 0x04
 func (m *MemScanner) PrintPmap() {
+	fmt.Printf("%-18v %-15v %-10v %-10v %-10v\n", "BaseAddress", "RegionSize(kb)", "State", "Protect", "Type")
 	for _, v := range m.PmapItems {
-		fmt.Printf("0x%-16X %-10v %v %v\n", v.Address, v.Kbytes/1024, v.Module, v.Flag)
+		fmt.Printf("0x%-16X %-15v %-10x %-10x %-10x\n", v.BaseAddress, v.RegionSize/1024, v.State, v.Protect, v.Type)
 	}
 }
 
@@ -123,53 +112,21 @@ func (m *MemScanner) PrintMem(startStr string, offStr string) {
 	fmt.Println()
 }
 
-func GetPmapItems(processID uint32) ([]PmapItem, error) {
-	var result []PmapItem
-
-	mes, err := GetProcessModules(processID)
-	if err != nil {
-		log.Println("GetProcessModules err")
-		return nil, err
-	}
-	for _, me := range mes {
-		Module := Convert(me.ExePath[:])
-		if !strings.HasSuffix(strings.ToUpper(Module), ".DLL") {
-			result = append(result, PmapItem{
-				Address: me.ModBaseAddr,
-				Kbytes:  me.ModBaseSize,
-				Module:  Module,
-			})
+func (m *MemScanner) LoadPmapItems() {
+	var address uintptr = 0
+	var mbi windows.MemoryBasicInformation
+	var err error
+	for {
+		err = windows.VirtualQueryEx(m.Handle, address, &mbi, unsafe.Sizeof(mbi))
+		if err != nil {
+			break
 		}
+		if mbi.State == windows.MEM_COMMIT && mbi.Protect == windows.PAGE_READWRITE {
+			m.PmapItems = append(m.PmapItems, mbi)
+		}
+
+		address += mbi.RegionSize
 	}
-
-	// 读不了最后一段堆内存
-	//phlist, err := GetProcessHeapList(processID)
-	//if err != nil {
-	//	log.Println("GetProcessHeapList err")
-	//	return nil, err
-	//}
-	//
-	//for _, ph := range phlist {
-	//	heap, err := GetProcessHeap(ph.Th32ProcessID, ph.Th32HeapID)
-	//	if err != nil {
-	//		log.Println("GetProcessHeap err")
-	//		return nil, err
-	//	}
-	//
-	//	for _, block := range heap {
-	//		//bs += block.DwBlockSize
-	//		if block.DwFlags == 1 {
-	//			result = append(result, PmapItem{
-	//				Address: block.DwAddress,
-	//				Kbytes:  uint32(block.DwBlockSize),
-	//				Module:  "heap",
-	//				Flag:    block.DwFlags,
-	//			})
-	//		}
-	//	}
-	//}
-
-	return result, nil
 }
 
 // 打印匹配结果
@@ -187,7 +144,7 @@ func (m *MemScanner) PrintResult() {
 		//m.MemFD.Read(b)
 		windows.ReadProcessMemory(m.Handle, uintptr(m.Result[i]), &b[0], 8, nil)
 
-		fmt.Printf("%-2v0x%-16x% x\n", i, m.Result[i], b)
+		fmt.Printf("%-2v0x%-16X% x\n", i, m.Result[i], b)
 	}
 	if flag {
 		fmt.Println("...")
@@ -254,13 +211,13 @@ func (m *MemScanner) Scan(value string) {
 
 	// 扫描所有内存段
 	for _, item := range m.PmapItems {
-		start := int64(item.Address)
-		mem := make([]byte, item.Kbytes)
+		start := int64(item.BaseAddress)
+		mem := make([]byte, item.RegionSize)
 		var n uintptr
-		err := windows.ReadProcessMemory(m.Handle, item.Address, &mem[0], uintptr(item.Kbytes), &n)
-		if err != nil || uint32(n) != item.Kbytes {
-			log.Printf("读取失败！%v %X %v %v", n, item.Address, item.Kbytes, err)
-			return
+		err := windows.ReadProcessMemory(m.Handle, item.BaseAddress, &mem[0], uintptr(item.RegionSize), &n)
+		if err != nil || n != item.RegionSize {
+			log.Printf("读取失败！%v %X %v %v", n, item.BaseAddress, item.RegionSize, err)
+			continue
 		}
 
 		// 扫描内存, -8 +2
